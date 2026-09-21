@@ -59,6 +59,14 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 
+<!-- Google Identity Services: powers the "Sign in with Google Drive"
+     button. Requires this page to be hosted at a real https:// address
+     (not a local file) and a Client ID pasted into the GOOGLE_CLIENT_ID
+     constant in the script below — see the setup walkthrough. Loaded
+     from Google directly (not embedded, unlike SheetJS) since it needs
+     to talk to Google's live authentication servers. -->
+<script src="https://accounts.google.com/gsi/client" onload="initGoogleAuth()" defer></script>
+
 <!-- All CSS lives in style.css (see its own header comment for how it's
      organized) and is inlined here as one <style> block by build.py. -->
 <style>
@@ -544,6 +552,15 @@ footer{margin-top:36px; padding-top:14px; border-top:1px solid var(--line); font
       <button class="btn btn-ghost" id="openBtn">Open a specific file instead</button>
       <input type="file" id="fileInputFallback" accept=".xlsx" style="display:none;">
       <span class="file-status" id="fileStatus">No file open yet — nothing is sent anywhere; everything happens in this browser tab.</span>
+    </div>
+
+    <!-- Google Drive: signs in, then auto-detects a folder named "Internal
+         Audit" and loads whatever's inside it — see the "GOOGLE DRIVE
+         INTEGRATION" section in the script for the full explanation,
+         including the one-time setup this needs before it'll work. -->
+    <div class="file-bar" style="margin-top:10px;">
+      <button class="btn btn-ghost" id="driveSignInBtn">Sign in with Google Drive</button>
+      <span class="file-status" id="driveStatus"></span>
     </div>
 
     <!-- Shown only for workbooks with more than one sheet — lets you
@@ -1161,7 +1178,12 @@ async function useFileHandle(handle, opts = {}) {
   } else {
     rememberedHandleForReconnect = null;
     showCornerBadge(fileName);
-    await rememberHandle(handle);
+    // Drive-backed handles are plain JS objects (see createDriveFileHandle
+    // below) — they can't survive IndexedDB's structured-clone the way a
+    // real browser FileSystemFileHandle can, so there's nothing to persist.
+    // Re-authenticating with Google each session naturally re-fetches
+    // fresh file references anyway.
+    if (!handle._isDrive) await rememberHandle(handle);
   }
 }
 
@@ -2447,6 +2469,226 @@ document.getElementById("themeToggleBtn").addEventListener("click", () => {
 // Sync the button's tooltip with whatever the early <head> script already
 // applied (it only sets the attribute; it doesn't know about the button).
 applyTheme(document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark");
+
+// =============================================================================
+// GOOGLE DRIVE INTEGRATION
+// =============================================================================
+// Adds a second way to open files, alongside the existing local
+// folder/file pickers: sign in with Google, auto-detect a Drive folder
+// named "Internal Audit", and list the .xlsx files inside it — all
+// without needing to download anything locally first.
+//
+// REQUIREMENTS BEFORE THIS WORKS:
+//   1. This page must be hosted at a real https:// address (e.g. GitHub
+//      Pages). Google's sign-in does not work from a plain double-clicked
+//      local file (file://) — that's a Google platform rule, not
+//      something this code can work around.
+//   2. You need your own free Google Cloud "OAuth Client ID" and must
+//      paste it into GOOGLE_CLIENT_ID below. See the setup walkthrough
+//      provided alongside this file for the exact steps — it takes about
+//      5 minutes, one time, and doesn't require any coding.
+//   3. Every session, you'll need to click "Sign in with Google Drive"
+//      once — like the "one click" file-permission requirement discussed
+//      earlier, a page can never silently regain access to your account;
+//      that's Google's security model, not a limitation of this code.
+//
+// HOW IT PLUGS INTO EVERYTHING ELSE:
+//   createDriveFileHandle() below wraps a Google Drive file in an object
+//   with the exact same shape as a browser FileSystemFileHandle
+//   (.getFile(), .queryPermission(), .requestPermission(),
+//   .createWritable()) — the same interface useFileHandle(), saveSession(),
+//   and the whole combined-view system already expect. That's the whole
+//   trick: once a Drive file is wrapped this way, EVERYTHING else in this
+//   app — opening, editing, commenting, the combined "All files" view,
+//   follow-up-sheet syncing — works completely unchanged, with no idea
+//   whether a given file came from your disk or from Drive.
+// =============================================================================
+
+// ---- ONE-TIME SETUP: paste your own OAuth Client ID here ------------------
+const GOOGLE_CLIENT_ID = "PASTE_YOUR_CLIENT_ID_HERE.apps.googleusercontent.com";
+// -----------------------------------------------------------------------------
+
+// Full read/write access to Drive is requested (not the narrower
+// "drive.file" scope) because this tool needs to find and open an
+// EXISTING folder/files it didn't create itself — drive.file only ever
+// sees files the app created or that you pick one-by-one through Google's
+// own file picker UI, which wouldn't allow the "auto-detect a folder and
+// read everything in it" behavior this was built for.
+const GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive";
+const DRIVE_FOLDER_NAME = "Internal Audit";
+const DRIVE_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const DRIVE_GOOGLE_SHEET_MIME = "application/vnd.google-apps.spreadsheet";
+
+let googleTokenClient = null;
+let driveAccessToken = null;
+
+// Called once the Google Identity Services script (loaded elsewhere in
+// this page) has finished loading. If you haven't pasted a real Client ID
+// in yet, this quietly does nothing — the sign-in button will explain why
+// when clicked, rather than the page silently failing on load.
+function initGoogleAuth() {
+  if (typeof google === "undefined" || !google.accounts || GOOGLE_CLIENT_ID.startsWith("PASTE_")) return;
+  googleTokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: GOOGLE_DRIVE_SCOPE,
+    callback: async (resp) => {
+      if (resp.error) {
+        document.getElementById("driveStatus").textContent = "Google sign-in failed: " + resp.error;
+        return;
+      }
+      driveAccessToken = resp.access_token;
+      document.getElementById("driveSignInBtn").textContent = "Signed in to Google Drive ✓";
+      await autoLoadInternalAuditFolder();
+    },
+  });
+}
+window.addEventListener("load", initGoogleAuth);
+
+document.getElementById("driveSignInBtn").addEventListener("click", () => {
+  if (GOOGLE_CLIENT_ID.startsWith("PASTE_")) {
+    alert(
+      "Google Drive isn't set up yet.\n\n" +
+      "This needs a one-time, free Google Cloud OAuth Client ID pasted into " +
+      "the GOOGLE_CLIENT_ID constant near the top of the Google Drive section " +
+      "in the script. See the setup walkthrough for exact steps."
+    );
+    return;
+  }
+  if (!googleTokenClient) {
+    alert("Google sign-in couldn't initialize — check your internet connection and reload the page.");
+    return;
+  }
+  document.getElementById("driveStatus").textContent = "Opening Google sign-in…";
+  googleTokenClient.requestAccessToken();
+});
+
+// Every Drive API call goes through here so token-expiry is handled in
+// exactly one place. Google's access tokens are short-lived (about an
+// hour) — when one expires, every call starts failing with 401, at which
+// point the honest thing to do is ask you to sign in again, not silently
+// retry or fail in a confusing way somewhere else in the app.
+async function driveApiFetch(url, options = {}) {
+  const resp = await fetch(url, {
+    ...options,
+    headers: { ...(options.headers || {}), Authorization: `Bearer ${driveAccessToken}` },
+  });
+  if (resp.status === 401) {
+    driveAccessToken = null;
+    document.getElementById("driveSignInBtn").textContent = "Sign in with Google Drive";
+    throw new Error('Google sign-in expired — click "Sign in with Google Drive" again.');
+  }
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`Google Drive request failed (${resp.status}). ${body.slice(0, 200)}`);
+  }
+  return resp;
+}
+
+async function findDriveFolder(name) {
+  const escaped = name.replace(/'/g, "\\'");
+  const q = encodeURIComponent(`name='${escaped}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+  const resp = await driveApiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`);
+  const data = await resp.json();
+  return (data.files && data.files[0]) || null;
+}
+
+async function listXlsxInDriveFolder(folderId) {
+  const q = encodeURIComponent(
+    `'${folderId}' in parents and trashed=false and (mimeType='${DRIVE_XLSX_MIME}' or mimeType='${DRIVE_GOOGLE_SHEET_MIME}')`
+  );
+  const resp = await driveApiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,mimeType)&pageSize=200`);
+  const data = await resp.json();
+  return data.files || [];
+}
+
+async function driveDownloadBytes(fileId, mimeType) {
+  // A native Google Sheet (not an actual .xlsx binary) has to be
+  // SERVER-SIDE CONVERTED on download via the "export" endpoint — Drive's
+  // plain "download the raw bytes" endpoint only works for real files.
+  const url = mimeType === DRIVE_GOOGLE_SHEET_MIME
+    ? `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=${encodeURIComponent(DRIVE_XLSX_MIME)}`
+    : `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+  const resp = await driveApiFetch(url);
+  return await resp.arrayBuffer();
+}
+
+async function driveUploadBytes(fileId, data) {
+  await driveApiFetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+    method: "PATCH",
+    headers: { "Content-Type": DRIVE_XLSX_MIME },
+    body: data,
+  });
+}
+
+// The adapter described in the section header above: makes one Google
+// Drive file look exactly like a FileSystemFileHandle to the rest of the
+// app. Native Google Sheets (as opposed to actual uploaded .xlsx files)
+// are read-only here — writing back would mean converting Drive's native
+// format, which isn't attempted; keep the actual report files as real
+// .xlsx uploads in the Drive folder for full read/write support.
+function createDriveFileHandle(fileId, name, mimeType) {
+  const isRealXlsx = mimeType === DRIVE_XLSX_MIME;
+  return {
+    kind: "file",
+    name,
+    _isDrive: true,
+    async getFile() {
+      const buf = await driveDownloadBytes(fileId, mimeType);
+      return new File([buf], name);
+    },
+    async queryPermission() {
+      if (!driveAccessToken) return "prompt";
+      return isRealXlsx ? "granted" : "denied";
+    },
+    async requestPermission() {
+      return this.queryPermission();
+    },
+    async createWritable() {
+      if (!isRealXlsx) {
+        throw new Error(`"${name}" is a native Google Sheet, not an uploaded .xlsx file — reading works, but saving back isn't supported for this file type.`);
+      }
+      return {
+        async write(data) { await driveUploadBytes(fileId, data); },
+        async close() {},
+      };
+    },
+  };
+}
+
+async function autoLoadInternalAuditFolder() {
+  const statusEl = document.getElementById("driveStatus");
+  statusEl.textContent = `Looking for a folder named "${DRIVE_FOLDER_NAME}" in your Google Drive…`;
+  try {
+    const folder = await findDriveFolder(DRIVE_FOLDER_NAME);
+    if (!folder) {
+      statusEl.textContent = `Signed in, but couldn't find a folder named "${DRIVE_FOLDER_NAME}" in your Drive. Create one (or rename an existing folder) and try again.`;
+      return;
+    }
+    const files = await listXlsxInDriveFolder(folder.id);
+    if (!files.length) {
+      statusEl.textContent = `Found "${DRIVE_FOLDER_NAME}", but it has no .xlsx or Google Sheets files in it yet.`;
+      return;
+    }
+    currentFolderFiles = files.map((f) => ({
+      name: f.name,
+      handle: createDriveFileHandle(f.id, f.name, f.mimeType),
+    }));
+    statusEl.textContent = `Found "${DRIVE_FOLDER_NAME}" — ${files.length} file${files.length === 1 ? "" : "s"} loaded.`;
+    renderSwitchList();
+
+    // Jump straight into whatever's most useful: open the one file
+    // directly, or go straight to the combined view when there's more
+    // than one — matching "automatically read the files in it" rather
+    // than requiring an extra click after signing in.
+    if (files.length === 1) {
+      await useFileHandle(currentFolderFiles[0].handle);
+    } else {
+      document.getElementById("tabCombined").click();
+    }
+  } catch (err) {
+    statusEl.textContent = "Error: " + err.message;
+  }
+}
 
 </script>
 
