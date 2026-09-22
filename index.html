@@ -1171,9 +1171,12 @@ async function useFileHandle(handle, opts = {}) {
 
   if (!writable) {
     fileHandle = null; // force the honest download-fallback path rather than pretending
+    const howToFix = handle._isDrive
+      ? `Ask whoever owns this Drive folder to give you Editor (not just Viewer) access.`
+      : `Reopen it and choose "Edit" (not "View only") if your browser asked.`;
     flashStatus(
-      `Editing "${fileName}" — you didn't grant edit permission, so saves will download an updated copy ` +
-      `instead of updating the file directly. Reopen it and choose "Edit" (not "View only") if your browser asked.`
+      `Editing "${fileName}" — you don't have edit permission, so saves will download an updated copy ` +
+      `instead of updating the file directly. ${howToFix}`
     );
   } else {
     rememberedHandleForReconnect = null;
@@ -2505,7 +2508,7 @@ applyTheme(document.documentElement.getAttribute("data-theme") === "light" ? "li
 // =============================================================================
 
 // ---- ONE-TIME SETUP: paste your own OAuth Client ID here ------------------
-const GOOGLE_CLIENT_ID = "266151179037-31hb7cd1rug94o423ab4kbonrqcfo060.apps.googleusercontent.com";
+const GOOGLE_CLIENT_ID = "PASTE_YOUR_CLIENT_ID_HERE.apps.googleusercontent.com";
 // -----------------------------------------------------------------------------
 
 // Full read/write access to Drive is requested (not the narrower
@@ -2626,6 +2629,21 @@ async function driveUploadBytes(fileId, data) {
 // are read-only here — writing back would mean converting Drive's native
 // format, which isn't attempted; keep the actual report files as real
 // .xlsx uploads in the Drive folder for full read/write support.
+// Asks Drive directly whether the SIGNED-IN PERSON can actually edit THIS
+// file — not just whether they're signed in. This matters as soon as more
+// than one person uses the same shared folder: someone Drive has only
+// given "Viewer" access to must not be told they have write access just
+// because they successfully authenticated.
+async function driveCanEditFile(fileId) {
+  try {
+    const resp = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=capabilities`);
+    const data = await resp.json();
+    return !!(data.capabilities && data.capabilities.canEdit);
+  } catch (err) {
+    return false; // if we can't even ask, the safe assumption is "no"
+  }
+}
+
 function createDriveFileHandle(fileId, name, mimeType) {
   const isRealXlsx = mimeType === DRIVE_XLSX_MIME;
   return {
@@ -2638,17 +2656,28 @@ function createDriveFileHandle(fileId, name, mimeType) {
     },
     async queryPermission() {
       if (!driveAccessToken) return "prompt";
-      return isRealXlsx ? "granted" : "denied";
+      if (!isRealXlsx) return "denied"; // native Google Sheets: read-only, see createWritable() below
+      const canEdit = await driveCanEditFile(fileId);
+      return canEdit ? "granted" : "denied";
     },
     async requestPermission() {
-      return this.queryPermission();
+      return this.queryPermission(); // Drive's permission is Drive's permission — there's no extra "request" step to take
     },
     async createWritable() {
       if (!isRealXlsx) {
         throw new Error(`"${name}" is a native Google Sheet, not an uploaded .xlsx file — reading works, but saving back isn't supported for this file type.`);
       }
       return {
-        async write(data) { await driveUploadBytes(fileId, data); },
+        async write(data) {
+          try {
+            await driveUploadBytes(fileId, data);
+          } catch (err) {
+            if (err.message.includes("403")) {
+              throw new Error(`You have read-only access to "${name}" — ask whoever owns the Drive folder for Editor access to save changes directly.`);
+            }
+            throw err;
+          }
+        },
         async close() {},
       };
     },
